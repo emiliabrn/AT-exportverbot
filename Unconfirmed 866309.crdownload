@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Täglicher Monitor für die BASG-Exportverbotsliste (Österreich).
+
+Holt die Liste, vergleicht mit dem Vortag, schreibt eine Webseite (docs/index.html)
+und verschickt bei Änderungen eine E-Mail.
+
+Aufruf:
+  python monitor.py                 # live abrufen (Playwright)
+  python monitor.py --debug         # zusätzlich alle JSON-Antworten nach debug/ speichern
+  python monitor.py --from-json f   # Testlauf mit lokaler JSON-Datei
+  python monitor.py --no-mail       # keine E-Mail senden
+"""
+import argparse, hashlib, html, json, os, smtplib, sys
+from datetime import date, timedelta
+from email.message import EmailMessage
+from pathlib import Path
+
+URL = os.environ.get("BASG_URL", "https://medikamente.basg.gv.at/de/export-ban")
+PAGE_URL = os.environ.get("PAGE_URL", "")  # z.B. https://DEINNAME.github.io/exportverbot/
+DATA, DOCS, DEBUG = Path("data"), Path("docs"), Path("debug")
+HISTORY_DAYS = 90
+MAX_DROP = 0.8  # Schutz: bricht ab, wenn >80 % der Liste plötzlich fehlen
+
+
+# ---------- Abruf ----------
+def largest_record_list(obj):
+    """Findet rekursiv die längste Liste von Dicts in einer JSON-Antwort."""
+    best = []
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj):
+            best = obj
+        for x in obj:
+            c = largest_record_list(x)
+            if len(c) > len(best):
+                best = c
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            c = largest_record_list(v)
+            if len(c) > len(best):
+                best = c
+    return best
+
+
+def fetch_live(debug=False):
+    from playwright.sync_api import sync_playwright
+    captured = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(locale="de-AT")
+
+        def on_response(resp):
+            try:
+                if "json" in (resp.headers.get("content-type") or ""):
+                    captured.append((resp.url, resp.json()))
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        page.goto(URL, wait_until="networkidle", timeout=90_000)
+        page.wait_for_timeout(3000)
+
+        records = []
+        for _, body in captured:
+            c = largest_record_list(body)
+            if len(c) > len(records):
+                records = c
+
+        if not records:  # Fallback: sichtbare Tabelle auslesen
+            records = page.evaluate("""() => {
+                const t = document.querySelector('table'); if (!t) return [];
+                const heads = [...t.querySelectorAll('thead th')].map(h => h.innerText.trim());
+                return [...t.querySelectorAll('tbody tr')].map(tr => {
+                    const o = {}; [...tr.querySelectorAll('td')].forEach((td,i) =>
+                        o[heads[i] || 'spalte'+i] = td.innerText.trim()); return o; });
+            }""")
+        if debug:
+            DEBUG.mkdir(exist_ok=True)
+            for i, (u, b) in enumerate(captured):
+                (DEBUG / f"response_{i}.json").write_text(
+                    json.dumps({"url": u, "body": b}, ensure_ascii=False, indent=1))
+            page.screenshot(path=str(DEBUG / "page.png"), full_page=True)
+        browser.close()
+    return records
+
+
+# ---------- Normalisierung ----------
+def pick(rec, exact=(), contains=()):
+    for k, v in rec.items():
+        kl = k.lower()
+        if isinstance(v, (str, int)) and v != "" and (kl in exact or any(c in kl for c in contains)):
+            return str(v)
+    return None
+
+
+def normalize(records):
+    items = {}
+    for rec in records:
+        ident = pick(rec, exact=("id", "pzn"), contains=("zulassung", "pzn", "zlnr"))
+        name = pick(rec, contains=("bezeichnung", "name", "arzneimittel", "titel", "title")) or ident or "?"
+        if not ident:
+            ident = hashlib.sha1(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
+        key, n = ident, 1
+        while key in items:
+            n += 1
+            key = f"{ident}#{n}"
+        details = {k: v for k, v in rec.items() if isinstance(v, (str, int, float)) and v != ""}
+        items[key] = {"name": name, "details": details}
+    return items
+
+
+# ---------- Vergleich & Speicher ----------
+def load(path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def diff(old, new):
+    added = [dict(id=k, **new[k]) for k in new if k not in old]
+    removed = [dict(id=k, **old[k]) for k in old if k not in new]
+    return added, removed
+
+
+# ---------- Ausgabe ----------
+CSS = """:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--line:#ddd;--add:#0a7d33;--rem:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--mut:#999;--line:#333;--add:#5fd48a;--rem:#ff8a80}}
+body{font:16px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:960px;margin:0 auto;padding:1.5rem}
+h1{font-size:1.5rem}h2{font-size:1.15rem;margin-top:2rem}.mut{color:var(--mut)}
+.add{color:var(--add)}.rem{color:var(--rem)}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);padding:.4rem .5rem;text-align:left;vertical-align:top}
+input{width:100%;padding:.5rem;margin:.5rem 0;font:inherit}small{color:var(--mut)}
+.wrap{overflow-x:auto}"""
+
+
+def fmt_details(d, name):
+    return "; ".join(f"{k}: {v}" for k, v in list(d.items())[:6] if str(v) != name)
+
+
+def render_page(today, items, history, source_url):
+    e = html.escape
+    rows = "".join(
+        f"<tr><td>{e(v['name'])}</td><td><small>{e(fmt_details(v['details'], v['name']))}</small></td></tr>"
+        for v in sorted(items.values(), key=lambda x: x["name"].lower()))
+    hist = ""
+    for h in reversed(history):
+        if not h["added"] and not h["removed"]:
+            continue
+        hist += f"<h3>{e(h['date'])}</h3><ul>"
+        hist += "".join(f"<li class='add'>＋ {e(x['name'])}</li>" for x in h["added"])
+        hist += "".join(f"<li class='rem'>－ {e(x['name'])}</li>" for x in h["removed"])
+        hist += "</ul>"
+    hist = hist or "<p class='mut'>Noch keine Änderungen seit Beobachtungsbeginn.</p>"
+    return f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Exportverbot Österreich – Änderungen</title>
+<style>{CSS}</style></head><body>
+<h1>Exportverbotsliste Österreich</h1>
+<p class="mut">Stand: {e(today)} · {len(items)} Arzneimittel auf der Liste ·
+Quelle: <a href="{e(source_url)}">BASG</a>. Inoffizielle Auswertung, maßgeblich ist die BASG-Seite.</p>
+<h2>Änderungen (letzte {HISTORY_DAYS} Tage)</h2>{hist}
+<h2>Aktuelle Liste</h2>
+<input id="q" placeholder="Filtern…" oninput="for(const r of document.querySelectorAll('#t tr'))r.hidden=!r.innerText.toLowerCase().includes(this.value.toLowerCase())">
+<div class="wrap"><table id="t">{rows}</table></div></body></html>"""
+
+
+def render_mail(today, added, removed, total):
+    lines = [f"Exportverbotsliste Österreich – {today}", f"Aktuell {total} Arzneimittel auf der Liste.", ""]
+    lines.append(f"NEU AUF DER LISTE ({len(added)}):")
+    lines += [f"  + {x['name']}" for x in added] or ["  –"]
+    lines += ["", f"VON DER LISTE ENTFERNT ({len(removed)}):"]
+    lines += [f"  - {x['name']}" for x in removed] or ["  –"]
+    lines += ["", f"Quelle: {URL}"]
+    if PAGE_URL:
+        lines.append(f"Übersicht: {PAGE_URL}")
+    return "\n".join(lines)
+
+
+def send_mail(subject, body):
+    host, to = os.environ.get("SMTP_HOST"), os.environ.get("MAIL_TO")
+    if not (host and to):
+        print("E-Mail nicht konfiguriert (SMTP_HOST/MAIL_TO fehlen) – übersprungen.\n\n" + body)
+        return
+    user = os.environ.get("SMTP_USER", "")
+    msg = EmailMessage()
+    msg["Subject"], msg["To"] = subject, to
+    msg["From"] = os.environ.get("MAIL_FROM", user or to)
+    msg.set_content(body)
+    with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", 587))) as s:
+        s.starttls()
+        if user:
+            s.login(user, os.environ.get("SMTP_PASS", ""))
+        s.send_message(msg)
+    print("E-Mail gesendet an", to)
+
+
+# ---------- Main ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--no-mail", action="store_true")
+    ap.add_argument("--from-json")
+    a = ap.parse_args()
+
+    records = json.loads(Path(a.from_json).read_text()) if a.from_json else fetch_live(a.debug)
+    if isinstance(records, dict):
+        records = largest_record_list(records)
+    new = normalize(records)
+    if not new:
+        sys.exit("Keine Daten gefunden – Seitenstruktur geändert? Mit --debug erneut laufen lassen.")
+
+    DATA.mkdir(exist_ok=True); DOCS.mkdir(exist_ok=True)
+    latest = load(DATA / "latest.json", None)
+    history = load(DATA / "history.json", [])
+    today = date.today().isoformat()
+
+    if latest is None:  # erster Lauf = Basisstand, keine Mail
+        added, removed, first = [], [], True
+    else:
+        old = latest["items"]
+        if len(new) < len(old) * (1 - MAX_DROP):
+            sys.exit(f"Abbruch: Liste schrumpft von {len(old)} auf {len(new)} – vermutlich Abruffehler.")
+        added, removed = diff(old, new)
+        first = False
+
+    cutoff = (date.today() - timedelta(days=HISTORY_DAYS)).isoformat()
+    history = [h for h in history if h["date"] >= cutoff and h["date"] != today]
+    history.append({"date": today, "added": added, "removed": removed})
+
+    (DATA / "latest.json").write_text(json.dumps({"date": today, "items": new}, ensure_ascii=False, indent=1))
+    (DATA / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=1))
+    (DOCS / "index.html").write_text(render_page(today, new, history, URL))
+
+    print(f"{today}: {len(new)} Einträge, +{len(added)} / -{len(removed)}" + (" (Basisstand)" if first else ""))
+    if (added or removed) and not a.no_mail:
+        send_mail(f"Exportverbot AT: +{len(added)} / −{len(removed)}", render_mail(today, added, removed, len(new)))
+
+
+if __name__ == "__main__":
+    main()
